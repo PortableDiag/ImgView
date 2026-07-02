@@ -1,0 +1,11 @@
+# Rust build output (kept in $HOME on exfat; ignore anywhere)
+/target
+target/
+
+# Built binary artifact — distribute via Releases, not git
+/imgview
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,571 @@
+//! ImgView — a lightweight, Picasa-style image viewer.
+//!
+//! One big image up top with scroll-to-zoom / drag-to-pan, a thumbnail strip
+//! along the bottom, arrow-key navigation, and 90° rotate (with save-to-disk).
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
+
+use eframe::egui;
+use egui::{Align, Color32, Key, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
+use image::DynamicImage;
+
+const THUMB: u32 = 96;
+const IMAGE_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "ppm", "pgm",
+    "pbm", "pnm", "tga", "ico", "dds", "hdr", "exr", "qoi", "avif", "farbfeld",
+];
+
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Sorted list of image files in a directory (case-insensitive by name).
+fn list_images(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_image(p))
+        .collect();
+    out.sort_by_key(|p| p.file_name().map(|n| n.to_ascii_lowercase()));
+    out
+}
+
+/// Convert a decoded image to an egui-ready CPU image.
+fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+/// A finished thumbnail decode, shipped from the loader thread to the UI.
+struct ThumbMsg {
+    index: usize,
+    image: egui::ColorImage,
+}
+
+struct ImgView {
+    paths: Vec<PathBuf>,
+    index: usize,
+
+    // Current full image (unrotated source kept so rotation is lossless in-view).
+    src: Option<DynamicImage>,
+    angle: i32, // 0 / 90 / 180 / 270, clockwise
+    texture: Option<TextureHandle>,
+
+    // View transform.
+    scale: f32,     // screen pixels per image pixel
+    offset: Vec2,   // image top-left relative to the panel's top-left
+    fitting: bool,  // true => keep fitted to the window
+    need_layout: bool,
+
+    // Thumbnail strip.
+    thumbs: Vec<Option<TextureHandle>>,
+    thumb_rx: Option<Receiver<ThumbMsg>>,
+    scroll_to_selected: bool,
+
+    status: String,
+}
+
+impl ImgView {
+    fn new(cc: &eframe::CreationContext<'_>, initial: Option<String>) -> Self {
+        // Nicer default look.
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut app = Self {
+            paths: Vec::new(),
+            index: 0,
+            src: None,
+            angle: 0,
+            texture: None,
+            scale: 1.0,
+            offset: Vec2::ZERO,
+            fitting: true,
+            need_layout: true,
+            thumbs: Vec::new(),
+            thumb_rx: None,
+            scroll_to_selected: false,
+            status: String::new(),
+        };
+        if let Some(arg) = initial {
+            app.open_path(&cc.egui_ctx, Path::new(&arg));
+        }
+        app
+    }
+
+    // ---- loading ---------------------------------------------------------
+    fn open_path(&mut self, ctx: &egui::Context, path: &Path) {
+        if path.is_dir() {
+            self.open_folder(ctx, path, None);
+        } else if path.is_file() {
+            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            self.open_folder(ctx, &dir, Some(path.to_path_buf()));
+        }
+    }
+
+    fn open_folder(&mut self, ctx: &egui::Context, dir: &Path, select: Option<PathBuf>) {
+        self.paths = list_images(dir);
+        self.thumbs = vec![None; self.paths.len()];
+        self.spawn_thumb_loader();
+
+        let start = select
+            .and_then(|sel| {
+                let sel = std::fs::canonicalize(&sel).unwrap_or(sel);
+                self.paths.iter().position(|p| {
+                    std::fs::canonicalize(p).map(|c| c == sel).unwrap_or(false)
+                })
+            })
+            .unwrap_or(0);
+
+        if self.paths.is_empty() {
+            self.src = None;
+            self.texture = None;
+            self.status = format!("No images in {}", dir.display());
+        } else {
+            self.show_index(ctx, start);
+        }
+    }
+
+    /// Decode thumbnails on a background thread; results arrive via `thumb_rx`.
+    fn spawn_thumb_loader(&mut self) {
+        let (tx, rx) = channel::<ThumbMsg>();
+        self.thumb_rx = Some(rx);
+        let paths = self.paths.clone();
+        std::thread::spawn(move || {
+            for (index, path) in paths.iter().enumerate() {
+                if let Ok(img) = image::open(path) {
+                    let thumb = img.thumbnail(THUMB, THUMB);
+                    let image = to_color_image(&thumb);
+                    // If the receiver is gone (folder changed), stop early.
+                    if tx.send(ThumbMsg { index, image }).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn show_index(&mut self, ctx: &egui::Context, index: usize) {
+        if self.paths.is_empty() || index >= self.paths.len() {
+            return;
+        }
+        self.index = index;
+        let path = self.paths[index].clone();
+        match image::open(&path) {
+            Ok(img) => {
+                self.src = Some(img);
+                self.angle = 0;
+                self.rebuild_texture(ctx);
+                self.need_layout = true;
+                self.fitting = true;
+                self.scroll_to_selected = true;
+                self.status = format!(
+                    "{}  [{}/{}]",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    index + 1,
+                    self.paths.len()
+                );
+            }
+            Err(e) => {
+                self.status = format!("Failed to open {}: {e}", path.display());
+            }
+        }
+    }
+
+    fn next(&mut self, ctx: &egui::Context) {
+        if !self.paths.is_empty() {
+            let i = (self.index + 1) % self.paths.len();
+            self.show_index(ctx, i);
+        }
+    }
+
+    fn prev(&mut self, ctx: &egui::Context) {
+        if !self.paths.is_empty() {
+            let i = (self.index + self.paths.len() - 1) % self.paths.len();
+            self.show_index(ctx, i);
+        }
+    }
+
+    // ---- rotation --------------------------------------------------------
+    fn rotated(&self) -> Option<DynamicImage> {
+        self.src.as_ref().map(|s| match self.angle.rem_euclid(360) {
+            90 => s.rotate90(),
+            180 => s.rotate180(),
+            270 => s.rotate270(),
+            _ => s.clone(),
+        })
+    }
+
+    fn rebuild_texture(&mut self, ctx: &egui::Context) {
+        if let Some(img) = self.rotated() {
+            let color = to_color_image(&img);
+            self.texture = Some(ctx.load_texture("current", color, TextureOptions::LINEAR));
+            self.need_layout = true;
+        }
+    }
+
+    fn rotate(&mut self, ctx: &egui::Context, delta: i32) {
+        if self.src.is_some() {
+            self.angle = (self.angle + delta).rem_euclid(360);
+            self.fitting = true;
+            self.rebuild_texture(ctx);
+        }
+    }
+
+    fn save_rotation(&mut self, ctx: &egui::Context) {
+        if self.angle % 360 == 0 {
+            self.status = "Nothing to save (image not rotated)".into();
+            return;
+        }
+        let Some(rotated) = self.rotated() else { return };
+        let path = self.paths[self.index].clone();
+        match rotated.save(&path) {
+            Ok(()) => {
+                // Bake rotation into our source and refresh this thumbnail.
+                let thumb = to_color_image(&rotated.thumbnail(THUMB, THUMB));
+                self.thumbs[self.index] =
+                    Some(ctx.load_texture("thumb", thumb, TextureOptions::LINEAR));
+                self.src = Some(rotated);
+                self.angle = 0;
+                self.rebuild_texture(ctx);
+                self.status = format!(
+                    "Saved rotation → {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    // ---- view transform --------------------------------------------------
+    fn layout(&mut self, rect: Rect, img: Vec2) {
+        // Fit-to-window, centered.
+        self.scale = (rect.width() / img.x).min(rect.height() / img.y).min(1e6);
+        self.offset = (rect.size() - img * self.scale) * 0.5;
+    }
+
+    fn center_at(&mut self, rect: Rect, img: Vec2, scale: f32) {
+        self.scale = scale;
+        self.offset = (rect.size() - img * scale) * 0.5;
+    }
+}
+
+impl eframe::App for ImgView {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drain a few finished thumbnails per frame into GPU textures.
+        if let Some(rx) = &self.thumb_rx {
+            let mut pending = false;
+            for _ in 0..8 {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        if msg.index < self.thumbs.len() {
+                            self.thumbs[msg.index] = Some(ctx.load_texture(
+                                "thumb",
+                                msg.image,
+                                TextureOptions::LINEAR,
+                            ));
+                        }
+                        pending = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if pending {
+                ctx.request_repaint(); // keep pulling until the queue drains
+            }
+        }
+
+        // ---- keyboard ----
+        let (mut go_next, mut go_prev) = (false, false);
+        let (mut rot_cw, mut rot_ccw, mut do_save) = (false, false, false);
+        let (mut do_fit, mut do_actual, mut do_full, mut do_esc) =
+            (false, false, false, false);
+        ctx.input(|i| {
+            let shift = i.modifiers.shift;
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::Space) {
+                go_next = true;
+            }
+            if i.key_pressed(Key::ArrowLeft) {
+                go_prev = true;
+            }
+            if (i.key_pressed(Key::R) && !shift) || i.key_pressed(Key::CloseBracket) {
+                rot_cw = true;
+            }
+            if (i.key_pressed(Key::R) && shift) || i.key_pressed(Key::OpenBracket) {
+                rot_ccw = true;
+            }
+            if ctrl && i.key_pressed(Key::S) {
+                do_save = true;
+            }
+            if i.key_pressed(Key::F) {
+                do_fit = true;
+            }
+            if i.key_pressed(Key::Num1) {
+                do_actual = true;
+            }
+            if i.key_pressed(Key::F11) {
+                do_full = true;
+            }
+            if i.key_pressed(Key::Escape) {
+                do_esc = true;
+            }
+        });
+
+        // ---- top toolbar ----
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("📂 Open Folder").clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        self.open_folder(ctx, &dir, None);
+                    }
+                }
+                ui.separator();
+                if ui.button("◀ Prev").clicked() {
+                    go_prev = true;
+                }
+                if ui.button("Next ▶").clicked() {
+                    go_next = true;
+                }
+                ui.separator();
+                if ui.button("⟲ Rotate L").clicked() {
+                    rot_ccw = true;
+                }
+                if ui.button("⟳ Rotate R").clicked() {
+                    rot_cw = true;
+                }
+                if ui.button("💾 Save").clicked() {
+                    do_save = true;
+                }
+                ui.separator();
+                ui.label(&self.status);
+            });
+        });
+
+        // ---- bottom thumbnail strip ----
+        let mut clicked: Option<usize> = None;
+        egui::TopBottomPanel::bottom("thumbs")
+            .exact_height((THUMB + 24) as f32)
+            .show(ctx, |ui| {
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for i in 0..self.paths.len() {
+                                let selected = i == self.index;
+                                let stroke = if selected {
+                                    Stroke::new(2.0, Color32::from_rgb(90, 160, 240))
+                                } else {
+                                    Stroke::NONE
+                                };
+                                let resp = egui::Frame::none()
+                                    .stroke(stroke)
+                                    .inner_margin(2.0)
+                                    .show(ui, |ui| {
+                                        if let Some(tex) = &self.thumbs[i] {
+                                            let size = fit_within(tex.size_vec2(), THUMB as f32);
+                                            ui.add(
+                                                egui::Image::new((tex.id(), size))
+                                                    .sense(Sense::click()),
+                                            )
+                                        } else {
+                                            ui.add_sized(
+                                                [THUMB as f32, THUMB as f32],
+                                                egui::Spinner::new(),
+                                            )
+                                        }
+                                    })
+                                    .inner;
+                                if resp.clicked() {
+                                    clicked = Some(i);
+                                }
+                                if selected && self.scroll_to_selected {
+                                    resp.scroll_to_me(Some(Align::Center));
+                                }
+                            }
+                        });
+                    });
+            });
+        self.scroll_to_selected = false;
+
+        // ---- central image area ----
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(Color32::BLACK))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                if let Some(tex) = self.texture.clone() {
+                    let img = tex.size_vec2();
+                    if self.need_layout || self.fitting {
+                        self.layout(rect, img);
+                        self.need_layout = false;
+                    }
+
+                    let resp = ui.interact(rect, ui.id().with("canvas"), Sense::click_and_drag());
+
+                    // Zoom at cursor.
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if resp.hovered() && scroll != 0.0 {
+                        let factor = (scroll / 200.0).exp2();
+                        let new_scale = (self.scale * factor).clamp(
+                            self.layout_fit_scale(rect, img) * 0.2,
+                            40.0,
+                        );
+                        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                            let cursor = pos - rect.min.to_vec2();
+                            let before = (cursor.to_vec2() - self.offset) / self.scale;
+                            self.offset = cursor.to_vec2() - before * new_scale;
+                        }
+                        self.scale = new_scale;
+                        self.fitting = false;
+                    }
+
+                    // Pan.
+                    if resp.dragged() {
+                        self.offset += resp.drag_delta();
+                        self.fitting = false;
+                    }
+
+                    // Double-click toggles fit <-> 100%.
+                    if resp.double_clicked() {
+                        if self.fitting {
+                            self.center_at(rect, img, 1.0);
+                            self.fitting = false;
+                        } else {
+                            self.fitting = true;
+                            self.need_layout = true;
+                        }
+                    }
+
+                    // Paint (clipped to the panel).
+                    let min = rect.min + self.offset;
+                    let draw = Rect::from_min_size(min, img * self.scale);
+                    let painter = ui.painter_at(rect);
+                    painter.image(
+                        tex.id(),
+                        draw,
+                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Open a folder or drop an image  (📂 or Ctrl+O)");
+                    });
+                }
+            });
+
+        // ---- drag & drop ----
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(file) = dropped.into_iter().find_map(|f| f.path) {
+            self.open_path(ctx, &file);
+        }
+
+        // ---- apply actions ----
+        if go_next {
+            self.next(ctx);
+        }
+        if go_prev {
+            self.prev(ctx);
+        }
+        if rot_cw {
+            self.rotate(ctx, 90);
+        }
+        if rot_ccw {
+            self.rotate(ctx, -90);
+        }
+        if do_save {
+            self.save_rotation(ctx);
+        }
+        if do_fit {
+            self.fitting = true;
+            self.need_layout = true;
+        }
+        if do_actual {
+            self.fitting = false;
+            self.need_layout = false;
+            if let Some(tex) = &self.texture {
+                let img = tex.size_vec2();
+                let rect = ctx.available_rect();
+                self.center_at(rect, img, 1.0);
+            }
+        }
+        if do_full {
+            let is_full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_full));
+        }
+        if do_esc {
+            let is_full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            if is_full {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if let Some(i) = clicked {
+            self.show_index(ctx, i);
+        }
+    }
+}
+
+impl ImgView {
+    fn layout_fit_scale(&self, rect: Rect, img: Vec2) -> f32 {
+        (rect.width() / img.x).min(rect.height() / img.y)
+    }
+}
+
+/// Scale a size down so its largest side is at most `max` (never up).
+fn fit_within(size: Vec2, max: f32) -> Vec2 {
+    let f = (max / size.x).min(max / size.y).min(1.0);
+    size * f
+}
+
+/// A tiny generated app icon: blue sky, sun, green mountains.
+fn app_icon() -> egui::IconData {
+    let s = 64usize;
+    let mut rgba = vec![0u8; s * s * 4];
+    let put = |buf: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
+        let i = (y * s + x) * 4;
+        buf[i..i + 4].copy_from_slice(&c);
+    };
+    for y in 0..s {
+        for x in 0..s {
+            // sky
+            let mut c = [74, 144, 217, 255];
+            // sun
+            let (dx, dy) = (x as f32 - 16.0, y as f32 - 16.0);
+            if dx * dx + dy * dy < 8.0 * 8.0 {
+                c = [255, 211, 78, 255];
+            }
+            // mountains (two triangles rising from the bottom)
+            let fy = s as f32 - 1.0 - y as f32;
+            let m1 = (x as f32 - 6.0).abs() * 0.9;
+            let m2 = (x as f32 - 40.0).abs() * 1.1;
+            if fy < (28.0 - m1) || fy < (34.0 - m2) {
+                c = [47, 125, 79, 255];
+            }
+            put(&mut rgba, x, y, c);
+        }
+    }
+    egui::IconData { rgba, width: s as u32, height: s as u32 }
+}
+
+fn main() -> eframe::Result<()> {
+    let arg = std::env::args().nth(1);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 800.0])
+            .with_title("ImgView")
+            .with_icon(app_icon()),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "ImgView",
+        options,
+        Box::new(|cc| Ok(Box::new(ImgView::new(cc, arg)))),
+    )
+}

@@ -1,0 +1,16 @@
+[package]
+name = "imgview"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Picasa-style image viewer"
+
+[dependencies]
+eframe = { version = "0.29", default-features = true }
+egui = "0.29"
+image = "0.25"        # broad format support: png/jpeg/gif/webp/bmp/tiff/ico/...
+rfd = "0.15"          # native folder picker
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true          # smaller single binary
