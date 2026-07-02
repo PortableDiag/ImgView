@@ -5,6 +5,10 @@ along the bottom, scroll-to-zoom, drag-to-pan, arrow-key navigation, and 90°
 rotate. Built with `egui`/`eframe` and the `image` crate for broad format
 support (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, PNM, TGA, DDS, HDR, AVIF, …).
 
+Animated **GIF** and **WebP** play back at their real frame delays; all other
+formats show as stills. (Rotating an animation is view-only — save-to-disk is
+limited to single-frame images.)
+
 Compiles to a **single native binary** — copy it to any Linux box (with the
 usual GL/X11/Wayland libraries present) and run it. No runtime, no interpreter.
 

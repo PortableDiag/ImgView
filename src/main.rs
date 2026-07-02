@@ -5,12 +5,17 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
+use std::time::Duration;
 
 use eframe::egui;
 use egui::{Align, Color32, Key, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
-use image::DynamicImage;
+use image::codecs::gif::GifDecoder;
+use image::codecs::webp::WebPDecoder;
+use image::{AnimationDecoder, DynamicImage};
 
 const THUMB: u32 = 96;
 const IMAGE_EXTS: &[&str] = &[
@@ -45,6 +50,73 @@ fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
 }
 
+/// One frame of an image: pixels plus how long to show it (zero for static).
+struct AnimFrame {
+    image: DynamicImage,
+    delay: Duration,
+}
+
+/// Collect an animation decoder's frames, clamping delays the way browsers do.
+fn collect_anim(frames: image::Frames) -> Vec<AnimFrame> {
+    match frames.collect_frames() {
+        Ok(list) => list
+            .into_iter()
+            .map(|f| {
+                let mut delay: Duration = f.delay().into();
+                if delay < Duration::from_millis(20) {
+                    delay = Duration::from_millis(100);
+                }
+                AnimFrame {
+                    image: DynamicImage::ImageRgba8(f.into_buffer()),
+                    delay,
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Decode a file into frames. Static images yield a single frame; animated
+/// GIF/WebP yield every frame with per-frame delays.
+fn load_frames(path: &Path) -> Vec<AnimFrame> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if ext == "gif" {
+        if let Ok(file) = File::open(path) {
+            if let Ok(dec) = GifDecoder::new(BufReader::new(file)) {
+                let v = collect_anim(dec.into_frames());
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+    } else if ext == "webp" {
+        if let Ok(file) = File::open(path) {
+            if let Ok(dec) = WebPDecoder::new(BufReader::new(file)) {
+                if dec.has_animation() {
+                    let v = collect_anim(dec.into_frames());
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+        }
+    }
+
+    // Static fallback: PNG/JPEG/BMP/TIFF/… and non-animated gif/webp.
+    match image::open(path) {
+        Ok(img) => vec![AnimFrame {
+            image: img,
+            delay: Duration::ZERO,
+        }],
+        Err(_) => Vec::new(),
+    }
+}
+
 /// A finished thumbnail decode, shipped from the loader thread to the UI.
 struct ThumbMsg {
     index: usize,
@@ -55,10 +127,12 @@ struct ImgView {
     paths: Vec<PathBuf>,
     index: usize,
 
-    // Current full image (unrotated source kept so rotation is lossless in-view).
-    src: Option<DynamicImage>,
-    angle: i32, // 0 / 90 / 180 / 270, clockwise
-    texture: Option<TextureHandle>,
+    // Current image as frames (one for static images, many for animations).
+    frames: Vec<AnimFrame>,       // unrotated sources (rotation stays lossless)
+    textures: Vec<TextureHandle>, // rotated, ready to draw — one per frame
+    cur_frame: usize,
+    frame_elapsed: f32, // seconds the current frame has been shown
+    angle: i32,         // 0 / 90 / 180 / 270, clockwise
 
     // View transform.
     scale: f32,     // screen pixels per image pixel
@@ -81,9 +155,11 @@ impl ImgView {
         let mut app = Self {
             paths: Vec::new(),
             index: 0,
-            src: None,
+            frames: Vec::new(),
+            textures: Vec::new(),
+            cur_frame: 0,
+            frame_elapsed: 0.0,
             angle: 0,
-            texture: None,
             scale: 1.0,
             offset: Vec2::ZERO,
             fitting: true,
@@ -124,8 +200,8 @@ impl ImgView {
             .unwrap_or(0);
 
         if self.paths.is_empty() {
-            self.src = None;
-            self.texture = None;
+            self.frames.clear();
+            self.textures.clear();
             self.status = format!("No images in {}", dir.display());
         } else {
             self.show_index(ctx, start);
@@ -157,25 +233,31 @@ impl ImgView {
         }
         self.index = index;
         let path = self.paths[index].clone();
-        match image::open(&path) {
-            Ok(img) => {
-                self.src = Some(img);
-                self.angle = 0;
-                self.rebuild_texture(ctx);
-                self.need_layout = true;
-                self.fitting = true;
-                self.scroll_to_selected = true;
-                self.status = format!(
-                    "{}  [{}/{}]",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    index + 1,
-                    self.paths.len()
-                );
-            }
-            Err(e) => {
-                self.status = format!("Failed to open {}: {e}", path.display());
-            }
+        let frames = load_frames(&path);
+        if frames.is_empty() {
+            self.status = format!("Failed to open {}", path.display());
+            return;
         }
+        self.frames = frames;
+        self.cur_frame = 0;
+        self.frame_elapsed = 0.0;
+        self.angle = 0;
+        self.rebuild_textures(ctx);
+        self.need_layout = true;
+        self.fitting = true;
+        self.scroll_to_selected = true;
+        let anim = if self.frames.len() > 1 {
+            format!("  ·  animated, {} frames", self.frames.len())
+        } else {
+            String::new()
+        };
+        self.status = format!(
+            "{}  [{}/{}]{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            index + 1,
+            self.paths.len(),
+            anim
+        );
     }
 
     fn next(&mut self, ctx: &egui::Context) {
@@ -193,28 +275,35 @@ impl ImgView {
     }
 
     // ---- rotation --------------------------------------------------------
-    fn rotated(&self) -> Option<DynamicImage> {
-        self.src.as_ref().map(|s| match self.angle.rem_euclid(360) {
-            90 => s.rotate90(),
-            180 => s.rotate180(),
-            270 => s.rotate270(),
-            _ => s.clone(),
-        })
-    }
-
-    fn rebuild_texture(&mut self, ctx: &egui::Context) {
-        if let Some(img) = self.rotated() {
-            let color = to_color_image(&img);
-            self.texture = Some(ctx.load_texture("current", color, TextureOptions::LINEAR));
-            self.need_layout = true;
+    fn rotate_image(img: &DynamicImage, angle: i32) -> DynamicImage {
+        match angle.rem_euclid(360) {
+            90 => img.rotate90(),
+            180 => img.rotate180(),
+            270 => img.rotate270(),
+            _ => img.clone(),
         }
     }
 
+    fn rebuild_textures(&mut self, ctx: &egui::Context) {
+        let angle = self.angle;
+        let mut texs = Vec::with_capacity(self.frames.len());
+        for (i, f) in self.frames.iter().enumerate() {
+            let img = Self::rotate_image(&f.image, angle);
+            texs.push(ctx.load_texture(
+                format!("frame{i}"),
+                to_color_image(&img),
+                TextureOptions::LINEAR,
+            ));
+        }
+        self.textures = texs;
+        self.need_layout = true;
+    }
+
     fn rotate(&mut self, ctx: &egui::Context, delta: i32) {
-        if self.src.is_some() {
+        if !self.frames.is_empty() {
             self.angle = (self.angle + delta).rem_euclid(360);
             self.fitting = true;
-            self.rebuild_texture(ctx);
+            self.rebuild_textures(ctx);
         }
     }
 
@@ -223,7 +312,11 @@ impl ImgView {
             self.status = "Nothing to save (image not rotated)".into();
             return;
         }
-        let Some(rotated) = self.rotated() else { return };
+        if self.frames.len() != 1 {
+            self.status = "Save rotation isn't supported for animated images".into();
+            return;
+        }
+        let rotated = Self::rotate_image(&self.frames[0].image, self.angle);
         let path = self.paths[self.index].clone();
         match rotated.save(&path) {
             Ok(()) => {
@@ -231,9 +324,12 @@ impl ImgView {
                 let thumb = to_color_image(&rotated.thumbnail(THUMB, THUMB));
                 self.thumbs[self.index] =
                     Some(ctx.load_texture("thumb", thumb, TextureOptions::LINEAR));
-                self.src = Some(rotated);
+                self.frames[0] = AnimFrame {
+                    image: rotated,
+                    delay: Duration::ZERO,
+                };
                 self.angle = 0;
-                self.rebuild_texture(ctx);
+                self.rebuild_textures(ctx);
                 self.status = format!(
                     "Saved rotation → {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
@@ -279,6 +375,22 @@ impl eframe::App for ImgView {
             if pending {
                 ctx.request_repaint(); // keep pulling until the queue drains
             }
+        }
+
+        // ---- animation playback ----
+        if self.textures.len() > 1 {
+            let dt = ctx.input(|i| i.stable_dt).min(0.25);
+            self.frame_elapsed += dt;
+            let mut delay = self.frames[self.cur_frame].delay.as_secs_f32().max(0.02);
+            while self.frame_elapsed >= delay {
+                self.frame_elapsed -= delay;
+                self.cur_frame = (self.cur_frame + 1) % self.textures.len();
+                delay = self.frames[self.cur_frame].delay.as_secs_f32().max(0.02);
+            }
+            // Wake up exactly when the current frame should flip.
+            ctx.request_repaint_after(Duration::from_secs_f32(
+                (delay - self.frame_elapsed).max(0.0),
+            ));
         }
 
         // ---- keyboard ----
@@ -399,7 +511,7 @@ impl eframe::App for ImgView {
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                if let Some(tex) = self.texture.clone() {
+                if let Some(tex) = self.textures.get(self.cur_frame).cloned() {
                     let img = tex.size_vec2();
                     if self.need_layout || self.fitting {
                         self.layout(rect, img);
@@ -488,7 +600,7 @@ impl eframe::App for ImgView {
         if do_actual {
             self.fitting = false;
             self.need_layout = false;
-            if let Some(tex) = &self.texture {
+            if let Some(tex) = self.textures.get(self.cur_frame).cloned() {
                 let img = tex.size_vec2();
                 let rect = ctx.available_rect();
                 self.center_at(rect, img, 1.0);
@@ -555,7 +667,27 @@ fn app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
-    let arg = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().collect();
+
+    // Hidden diagnostic: `imgview --probe FILE` prints decoded frame info.
+    if args.get(1).map(|s| s == "--probe").unwrap_or(false) {
+        if let Some(p) = args.get(2) {
+            let frames = load_frames(Path::new(p));
+            println!("frames: {}", frames.len());
+            for (i, f) in frames.iter().enumerate() {
+                let img = &f.image;
+                println!(
+                    "  {i}: {}ms  {}x{}",
+                    f.delay.as_millis(),
+                    image::GenericImageView::width(img),
+                    image::GenericImageView::height(img)
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let arg = args.get(1).cloned();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
