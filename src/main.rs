@@ -128,10 +128,14 @@ struct ImgView {
     index: usize,
 
     // Current image as frames (one for static images, many for animations).
-    frames: Vec<AnimFrame>,       // unrotated sources (rotation stays lossless)
-    textures: Vec<TextureHandle>, // rotated, ready to draw — one per frame
+    // Frames stay decoded in RAM; only the *current* frame lives on the GPU,
+    // so a huge multi-hundred-frame GIF doesn't blow out VRAM.
+    frames: Vec<AnimFrame>,      // unrotated sources (rotation stays lossless)
+    texture: Option<TextureHandle>, // the single frame currently on the GPU
     cur_frame: usize,
     frame_elapsed: f32, // seconds the current frame has been shown
+    last_time: f64,     // wall-clock time (input.time) at the last update
+    speed: f32,         // animation playback speed multiplier (1.0 = normal)
     angle: i32,         // 0 / 90 / 180 / 270, clockwise
 
     // View transform.
@@ -156,9 +160,11 @@ impl ImgView {
             paths: Vec::new(),
             index: 0,
             frames: Vec::new(),
-            textures: Vec::new(),
+            texture: None,
             cur_frame: 0,
             frame_elapsed: 0.0,
+            last_time: 0.0,
+            speed: 1.0,
             angle: 0,
             scale: 1.0,
             offset: Vec2::ZERO,
@@ -201,7 +207,7 @@ impl ImgView {
 
         if self.paths.is_empty() {
             self.frames.clear();
-            self.textures.clear();
+            self.texture = None;
             self.status = format!("No images in {}", dir.display());
         } else {
             self.show_index(ctx, start);
@@ -242,7 +248,7 @@ impl ImgView {
         self.cur_frame = 0;
         self.frame_elapsed = 0.0;
         self.angle = 0;
-        self.rebuild_textures(ctx);
+        self.upload_current(ctx);
         self.need_layout = true;
         self.fitting = true;
         self.scroll_to_selected = true;
@@ -284,26 +290,29 @@ impl ImgView {
         }
     }
 
-    fn rebuild_textures(&mut self, ctx: &egui::Context) {
-        let angle = self.angle;
-        let mut texs = Vec::with_capacity(self.frames.len());
-        for (i, f) in self.frames.iter().enumerate() {
-            let img = Self::rotate_image(&f.image, angle);
-            texs.push(ctx.load_texture(
-                format!("frame{i}"),
-                to_color_image(&img),
-                TextureOptions::LINEAR,
-            ));
+    /// Upload only the current frame (rotated) to the single GPU texture,
+    /// reusing the existing texture slot when possible. Keeps VRAM at one
+    /// frame regardless of how many frames a GIF has.
+    fn upload_current(&mut self, ctx: &egui::Context) {
+        if self.frames.is_empty() {
+            return;
         }
-        self.textures = texs;
-        self.need_layout = true;
+        let idx = self.cur_frame.min(self.frames.len() - 1);
+        let img = Self::rotate_image(&self.frames[idx].image, self.angle);
+        let color = to_color_image(&img);
+        if let Some(tex) = self.texture.as_mut() {
+            tex.set(color, TextureOptions::LINEAR);
+        } else {
+            self.texture = Some(ctx.load_texture("current", color, TextureOptions::LINEAR));
+        }
     }
 
     fn rotate(&mut self, ctx: &egui::Context, delta: i32) {
         if !self.frames.is_empty() {
             self.angle = (self.angle + delta).rem_euclid(360);
             self.fitting = true;
-            self.rebuild_textures(ctx);
+            self.need_layout = true;
+            self.upload_current(ctx);
         }
     }
 
@@ -329,7 +338,7 @@ impl ImgView {
                     delay: Duration::ZERO,
                 };
                 self.angle = 0;
-                self.rebuild_textures(ctx);
+                self.upload_current(ctx);
                 self.status = format!(
                     "Saved rotation → {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
@@ -378,19 +387,27 @@ impl eframe::App for ImgView {
         }
 
         // ---- animation playback ----
-        if self.textures.len() > 1 {
-            let dt = ctx.input(|i| i.stable_dt).min(0.25);
-            self.frame_elapsed += dt;
+        // Use real wall-clock time (input.time), NOT stable_dt: stable_dt is a
+        // smoothed *predicted* frame interval (~16ms), but we only repaint once
+        // per frame-delay, so it would make animations run several times slow.
+        let now = ctx.input(|i| i.time);
+        let dt = ((now - self.last_time) as f32).clamp(0.0, 0.25);
+        self.last_time = now;
+        if self.frames.len() > 1 {
+            let start = self.cur_frame;
+            self.frame_elapsed += dt * self.speed.max(0.05);
             let mut delay = self.frames[self.cur_frame].delay.as_secs_f32().max(0.02);
             while self.frame_elapsed >= delay {
                 self.frame_elapsed -= delay;
-                self.cur_frame = (self.cur_frame + 1) % self.textures.len();
+                self.cur_frame = (self.cur_frame + 1) % self.frames.len();
                 delay = self.frames[self.cur_frame].delay.as_secs_f32().max(0.02);
             }
-            // Wake up exactly when the current frame should flip.
-            ctx.request_repaint_after(Duration::from_secs_f32(
-                (delay - self.frame_elapsed).max(0.0),
-            ));
+            if self.cur_frame != start {
+                self.upload_current(ctx); // swap the one GPU texture to this frame
+            }
+            // Wake up when the current frame should flip (scaled by speed).
+            let remaining = (delay - self.frame_elapsed).max(0.0) / self.speed.max(0.05);
+            ctx.request_repaint_after(Duration::from_secs_f32(remaining));
         }
 
         // ---- keyboard ----
@@ -398,6 +415,7 @@ impl eframe::App for ImgView {
         let (mut rot_cw, mut rot_ccw, mut do_save) = (false, false, false);
         let (mut do_fit, mut do_actual, mut do_full, mut do_esc) =
             (false, false, false, false);
+        let (mut faster, mut slower, mut reset_speed) = (false, false, false);
         ctx.input(|i| {
             let shift = i.modifiers.shift;
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
@@ -428,6 +446,15 @@ impl eframe::App for ImgView {
             if i.key_pressed(Key::Escape) {
                 do_esc = true;
             }
+            if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) {
+                faster = true;
+            }
+            if i.key_pressed(Key::Minus) {
+                slower = true;
+            }
+            if i.key_pressed(Key::Num0) {
+                reset_speed = true;
+            }
         });
 
         // ---- top toolbar ----
@@ -454,6 +481,20 @@ impl eframe::App for ImgView {
                 }
                 if ui.button("💾 Save").clicked() {
                     do_save = true;
+                }
+                // Playback-speed controls, only relevant for animations.
+                if self.frames.len() > 1 {
+                    ui.separator();
+                    if ui.button("🐢 Slower").clicked() {
+                        slower = true;
+                    }
+                    if ui.button("🐇 Faster").clicked() {
+                        faster = true;
+                    }
+                    if ui.button("Reset").clicked() {
+                        reset_speed = true;
+                    }
+                    ui.label(format!("{:.2}×", self.speed));
                 }
                 ui.separator();
                 ui.label(&self.status);
@@ -511,7 +552,7 @@ impl eframe::App for ImgView {
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                if let Some(tex) = self.textures.get(self.cur_frame).cloned() {
+                if let Some(tex) = self.texture.clone() {
                     let img = tex.size_vec2();
                     if self.need_layout || self.fitting {
                         self.layout(rect, img);
@@ -593,6 +634,15 @@ impl eframe::App for ImgView {
         if do_save {
             self.save_rotation(ctx);
         }
+        if faster {
+            self.speed = (self.speed * 1.5).min(16.0);
+        }
+        if slower {
+            self.speed = (self.speed / 1.5).max(0.1);
+        }
+        if reset_speed {
+            self.speed = 1.0;
+        }
         if do_fit {
             self.fitting = true;
             self.need_layout = true;
@@ -600,7 +650,7 @@ impl eframe::App for ImgView {
         if do_actual {
             self.fitting = false;
             self.need_layout = false;
-            if let Some(tex) = self.textures.get(self.cur_frame).cloned() {
+            if let Some(tex) = self.texture.clone() {
                 let img = tex.size_vec2();
                 let rect = ctx.available_rect();
                 self.center_at(rect, img, 1.0);

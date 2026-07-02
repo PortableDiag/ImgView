@@ -47,8 +47,13 @@ usual GL/X11/Wayland libraries present) and run it. No runtime, no interpreter.
 | Ctrl+S              | Save rotation back to the file   |
 | F                   | Fit to window                    |
 | 1                   | Actual size (100%)               |
+| + / -               | GIF playback faster / slower     |
+| 0                   | Reset playback speed to normal   |
 | F11                 | Fullscreen                       |
 | Esc                 | Exit fullscreen / quit           |
+
+Animations keep only the current frame on the GPU, so even large multi-hundred-
+frame GIFs play without exhausting video memory.
 
 Drag & drop an image or folder onto the window to open it.
 
