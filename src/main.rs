@@ -266,6 +266,15 @@ impl ImgView {
         );
     }
 
+    /// The bare filename of the currently shown image (empty if none).
+    fn cur_name(&self) -> String {
+        self.paths
+            .get(self.index)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     fn next(&mut self, ctx: &egui::Context) {
         if !self.paths.is_empty() {
             let i = (self.index + 1) % self.paths.len();
@@ -416,9 +425,16 @@ impl eframe::App for ImgView {
         let (mut do_fit, mut do_actual, mut do_full, mut do_esc) =
             (false, false, false, false);
         let (mut faster, mut slower, mut reset_speed) = (false, false, false);
+        let (mut do_open, mut do_copy) = (false, false);
         ctx.input(|i| {
             let shift = i.modifiers.shift;
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            if ctrl && i.key_pressed(Key::O) {
+                do_open = true;
+            }
+            if ctrl && i.key_pressed(Key::C) {
+                do_copy = true;
+            }
             if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::Space) {
                 go_next = true;
             }
@@ -460,80 +476,142 @@ impl eframe::App for ImgView {
         // ---- top toolbar ----
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📂 Open Folder").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.open_folder(ctx, &dir, None);
-                    }
+                if ui
+                    .button("📂 Open Folder")
+                    .on_hover_text("Open a folder  (Ctrl+O)")
+                    .clicked()
+                {
+                    do_open = true;
                 }
                 ui.separator();
-                if ui.button("◀ Prev").clicked() {
+                if ui.button("◀ Prev").on_hover_text("Previous  (←)").clicked() {
                     go_prev = true;
                 }
-                if ui.button("Next ▶").clicked() {
+                if ui
+                    .button("Next ▶")
+                    .on_hover_text("Next  (→ or Space)")
+                    .clicked()
+                {
                     go_next = true;
                 }
                 ui.separator();
-                if ui.button("⟲ Rotate L").clicked() {
+                if ui
+                    .button("⟲ Rotate L")
+                    .on_hover_text("Rotate left  (Shift+R or [)")
+                    .clicked()
+                {
                     rot_ccw = true;
                 }
-                if ui.button("⟳ Rotate R").clicked() {
+                if ui
+                    .button("⟳ Rotate R")
+                    .on_hover_text("Rotate right  (R or ])")
+                    .clicked()
+                {
                     rot_cw = true;
                 }
-                if ui.button("💾 Save").clicked() {
+                if ui
+                    .button("💾 Save")
+                    .on_hover_text("Save rotation to disk  (Ctrl+S)")
+                    .clicked()
+                {
                     do_save = true;
                 }
                 // Playback-speed controls, only relevant for animations.
                 if self.frames.len() > 1 {
                     ui.separator();
-                    if ui.button("🐢 Slower").clicked() {
+                    if ui.button("🐢 Slower").on_hover_text("Slower  (-)").clicked() {
                         slower = true;
                     }
-                    if ui.button("🐇 Faster").clicked() {
+                    if ui.button("🐇 Faster").on_hover_text("Faster  (+)").clicked() {
                         faster = true;
                     }
-                    if ui.button("Reset").clicked() {
+                    if ui.button("Reset").on_hover_text("Reset speed  (0)").clicked() {
                         reset_speed = true;
                     }
                     ui.label(format!("{:.2}×", self.speed));
                 }
                 ui.separator();
-                ui.label(&self.status);
+                // Copy the current filename to the clipboard.
+                if !self.paths.is_empty()
+                    && ui
+                        .button("📋 Copy name")
+                        .on_hover_text("Copy the filename to the clipboard  (Ctrl+C)")
+                        .clicked()
+                {
+                    do_copy = true;
+                }
+                // Selectable so the user can drag-select and copy any part of it.
+                ui.add(egui::Label::new(&self.status).selectable(true));
             });
         });
 
         // ---- bottom thumbnail strip ----
         let mut clicked: Option<usize> = None;
         egui::TopBottomPanel::bottom("thumbs")
-            .exact_height((THUMB + 24) as f32)
+            .exact_height((THUMB + 44) as f32)
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_top(|ui| {
                             for i in 0..self.paths.len() {
                                 let selected = i == self.index;
-                                let stroke = if selected {
-                                    Stroke::new(2.0, Color32::from_rgb(90, 160, 240))
-                                } else {
-                                    Stroke::NONE
-                                };
-                                let resp = egui::Frame::none()
-                                    .stroke(stroke)
-                                    .inner_margin(2.0)
-                                    .show(ui, |ui| {
-                                        if let Some(tex) = &self.thumbs[i] {
-                                            let size = fit_within(tex.size_vec2(), THUMB as f32);
+                                // Each thumbnail lives in a fixed-width, centered
+                                // cell so the filename caption lines up under it.
+                                let cell = Vec2::new(THUMB as f32 + 8.0, (THUMB + 40) as f32);
+                                let resp = ui
+                                    .allocate_ui_with_layout(
+                                        cell,
+                                        egui::Layout::top_down(Align::Center),
+                                        |ui| {
+                                            let stroke = if selected {
+                                                Stroke::new(2.0, Color32::from_rgb(90, 160, 240))
+                                            } else {
+                                                Stroke::NONE
+                                            };
+                                            let resp = egui::Frame::none()
+                                                .stroke(stroke)
+                                                .inner_margin(2.0)
+                                                .show(ui, |ui| {
+                                                    if let Some(tex) = &self.thumbs[i] {
+                                                        let size = fit_within(
+                                                            tex.size_vec2(),
+                                                            THUMB as f32,
+                                                        );
+                                                        ui.add(
+                                                            egui::Image::new((tex.id(), size))
+                                                                .sense(Sense::click()),
+                                                        )
+                                                    } else {
+                                                        ui.add_sized(
+                                                            [THUMB as f32, THUMB as f32],
+                                                            egui::Spinner::new(),
+                                                        )
+                                                    }
+                                                })
+                                                .inner;
+                                            // Filename caption, middle-truncated to fit.
+                                            let name = self.paths[i]
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy();
+                                            let color = if selected {
+                                                Color32::from_rgb(120, 180, 250)
+                                            } else {
+                                                Color32::GRAY
+                                            };
                                             ui.add(
-                                                egui::Image::new((tex.id(), size))
-                                                    .sense(Sense::click()),
+                                                egui::Label::new(
+                                                    egui::RichText::new(middle_ellipsis(&name, 16))
+                                                        .size(11.0)
+                                                        .color(color),
+                                                )
+                                                .truncate(),
                                             )
-                                        } else {
-                                            ui.add_sized(
-                                                [THUMB as f32, THUMB as f32],
-                                                egui::Spinner::new(),
-                                            )
-                                        }
-                                    })
+                                            .on_hover_text(name.as_ref());
+                                            resp
+                                        },
+                                    )
                                     .inner;
                                 if resp.clicked() {
                                     clicked = Some(i);
@@ -619,6 +697,15 @@ impl eframe::App for ImgView {
         }
 
         // ---- apply actions ----
+        if do_open {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.open_folder(ctx, &dir, None);
+            }
+        }
+        if do_copy && !self.paths.is_empty() {
+            let name = self.cur_name();
+            ctx.output_mut(|o| o.copied_text = name);
+        }
         if go_next {
             self.next(ctx);
         }
@@ -678,6 +765,25 @@ impl ImgView {
     fn layout_fit_scale(&self, rect: Rect, img: Vec2) -> f32 {
         (rect.width() / img.x).min(rect.height() / img.y)
     }
+}
+
+/// Shorten a string to at most `max` characters, dropping from the middle and
+/// inserting an ellipsis so both the start and the file extension stay visible.
+fn middle_ellipsis(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let keep = max - 1; // one slot for the ellipsis
+    let front = keep.div_ceil(2);
+    let back = keep - front;
+    let mut out: String = chars[..front].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - back..]);
+    out
 }
 
 /// Scale a size down so its largest side is at most `max` (never up).
