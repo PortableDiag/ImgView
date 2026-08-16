@@ -4,12 +4,49 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-08-16
 
-Not tagged: the scroll-zoom panic under **Known issues** should be fixed before
-a release is cut.
+First release since `v0.1.0`. Three crashes and one silent data-loss bug are
+fixed; every advertised format is now verified against a real sample.
+
+### Fixed
+- **Scroll-to-zoom no longer aborts the process on a small image.** The zoom
+  clamp mixed an image-relative lower bound (`fit_scale * 0.2`) with an absolute
+  upper bound (`40.0`); once an image fitted the window more than 200× over the
+  bounds crossed and `f32::clamp` panicked, killing the app with exit 101.
+  Reproduced at 1×1 and 4×3 in a 1100×800 window — and the threshold scaled with
+  the viewport, reaching roughly 19×10 px fullscreen on 4K. Bounds are now
+  reconciled in `zoom_bounds()`, and the ceiling rises to the fit scale so a tiny
+  image can still be magnified enough to fill the window.
+- **Opening an image larger than the GPU's maximum texture size no longer
+  crashes.** `egui` panics outright above that limit, which can be as low as
+  2048 px per side — i.e. any ordinary photo. Verified: a 4000×3000 PNG killed
+  the previous build on open and now displays. The GPU gets a downscaled copy;
+  `frames` keeps the original, so rotate-and-save still writes full resolution.
+- **Ctrl+S could overwrite an unrelated file.** After a failed decode the old
+  image stayed loaded while `index` had already moved on, so "save rotation"
+  wrote the *previous* picture over the file that failed to open. Reproduced by
+  driving the real window: a 23-byte file became a 6,661-byte PNG of the
+  previous image. A failed decode now clears the view and reports itself.
+- **A file that fails to decode no longer spins forever** in the thumbnail
+  strip. Failures are reported explicitly and render as a ⚠ marker, and the
+  central panel says which file failed instead of showing the cold-start
+  "Open a folder or drop an image" invitation with a folder already open.
+- **`.farbfeld` files were offered but could never open, and `.ff` files were
+  hidden.** The `image` crate recognises farbfeld only as `.ff`. `IMAGE_EXTS`
+  now lists `ff`.
+- **`avif` removed from `IMAGE_EXTS`.** There is no AVIF decoder in this build,
+  so listing the extension only produced files that were guaranteed to fail.
+- **Ctrl+C no longer clobbers a text selection.** Copying part of the status
+  path with the mouse and pressing Ctrl+C replaced it with the filename; the
+  filename is now only copied when nothing else claimed the clipboard.
+- **Saving a rotated JPEG re-encodes at quality 95** instead of the crate's
+  default 75, and the status bar says the file was re-encoded.
+- Zero-sized panels can no longer produce a non-finite fit scale.
 
 ### Added
+- Unit tests (`cargo test`) covering the zoom-clamp regression, the extension
+  list, JPEG detection, filename ellipsis and thumbnail fitting.
 - **Filename captions under every thumbnail.** Names are middle-truncated so the
   extension stays visible (`middle_ellipsis`), with the full name on hover. The
   strip is 20 px taller to make room, and each thumbnail now sits in a
@@ -25,28 +62,25 @@ a release is cut.
 - The status text is now a selectable label, so part of a path can be
   drag-selected and copied.
 
+### Changed (formats)
+- DDS, Radiance HDR and OpenEXR moved from **untested** to **verified** — real
+  samples were generated and probed rather than inferred from the crate's
+  feature list. Every extension in `IMAGE_EXTS` is now individually confirmed to
+  decode under the exact extension the viewer offers.
+
 ### Known issues
-- **Scroll-to-zoom panics on an extremely small image.** The zoom clamp in
-  `src/main.rs` mixes an image-relative lower bound (`fit_scale * 0.2`) with an
-  absolute upper bound (`40.0`); when an image fits the window more than ~200×
-  over, the lower bound overtakes the upper one and `f32::clamp` asserts,
-  aborting the process. Reproduced at 1×1 and 4×3 in a 1100×800 window; 6×4 and
-  larger are unaffected. The threshold scales with the viewport, so a fullscreen
-  4K window widens it to roughly 19×10 px.
-- **AVIF is listed in `IMAGE_EXTS` but cannot be decoded.** Default `image`
-  features include the `ravif` *encoder* and no decoder. Documented in the
-  README; whether to enable `avif-native` (which links system `libdav1d` and
-  ends the single-binary property) or drop the extension is undecided.
-- **A file that fails to decode keeps a spinner in the thumbnail strip forever**,
-  since a failed decode sends nothing and is indistinguishable from one still
-  running.
 - **Animated images hold every decoded frame in RAM** for as long as they are
   displayed, uncapped. Measured: a 48-frame 800×800 GIF costs ~117 MiB from a
-  107 KB file.
+  107 KB file. Capping this needs a memory budget to be chosen.
+- **Images above the GPU texture limit are shown downscaled.** Displaying them
+  at true resolution would need tiled textures.
+- **Thumbnails are decoded at full resolution** before scaling, so a folder of
+  very large photos is slow to fill the strip.
 
 ## [0.1.0] — 2026-07-01
 
-Initial three commits, never tagged or released.
+Initial three commits. Tagged `v0.1.0` and published as a GitHub release on
+2026-07-02 with an `imgview-linux-x86_64` binary attached.
 
 ### Added
 - Picasa-style viewer: one large image, background-loaded thumbnail strip,

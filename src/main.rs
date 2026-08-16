@@ -6,7 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
@@ -14,20 +14,48 @@ use std::time::Duration;
 use eframe::egui;
 use egui::{Align, Color32, Key, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use image::codecs::gif::GifDecoder;
+use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPDecoder;
 use image::{AnimationDecoder, DynamicImage};
 
 const THUMB: u32 = 96;
+/// Extensions we offer to open. Every one of these was probed against a real
+/// sample and decodes; two used to be listed that never could:
+///  * `avif` — the `image` crate's default features ship the AVIF *encoder*
+///    only, so every `.avif` failed to open.
+///  * `farbfeld` — the crate recognises farbfeld as `.ff`, and only as `.ff`,
+///    so `.farbfeld` files were offered and `.ff` files were hidden.
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "ppm", "pgm",
-    "pbm", "pnm", "tga", "ico", "dds", "hdr", "exr", "qoi", "avif", "farbfeld",
+    "pbm", "pnm", "tga", "ico", "dds", "hdr", "exr", "qoi", "ff",
 ];
 
+/// Hard ceiling on zoom for a normally-sized image. Small images may exceed it
+/// — see [`zoom_bounds`].
+const MAX_ZOOM: f32 = 40.0;
+/// Bounds on the fit-to-window scale, so it is always finite and divisible by.
+const MIN_SCALE: f32 = 1e-6;
+const MAX_SCALE: f32 = 1e6;
+
+/// Lower and upper bounds for the zoom clamp, given the fit-to-window scale.
+///
+/// The two bounds are computed on different bases — the floor is relative to
+/// the image, the ceiling is absolute — so they must be reconciled explicitly:
+/// `f32::clamp` panics if `min > max`, which used to abort the process when an
+/// image fitted the window more than `MAX_ZOOM / 0.2` times over (about 5x3 px
+/// in a default window, 19x10 fullscreen on 4K).
+///
+/// The ceiling also rises to `fit` for such images: a 1x1 needs several hundred
+/// times magnification just to fill the window, so a flat 40x cap would leave it
+/// unzoomable.
+fn zoom_bounds(fit: f32) -> (f32, f32) {
+    let hi = MAX_ZOOM.max(fit);
+    let lo = (fit * 0.2).min(hi);
+    (lo, hi)
+}
+
 fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    IMAGE_EXTS.contains(&ext_of(path).as_str())
 }
 
 /// Sorted list of image files in a directory (case-insensitive by name).
@@ -79,11 +107,7 @@ fn collect_anim(frames: image::Frames) -> Vec<AnimFrame> {
 /// Decode a file into frames. Static images yield a single frame; animated
 /// GIF/WebP yield every frame with per-frame delays.
 fn load_frames(path: &Path) -> Vec<AnimFrame> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = ext_of(path);
 
     if ext == "gif" {
         if let Ok(file) = File::open(path) {
@@ -118,9 +142,20 @@ fn load_frames(path: &Path) -> Vec<AnimFrame> {
 }
 
 /// A finished thumbnail decode, shipped from the loader thread to the UI.
+/// `image` is `None` when the file could not be decoded — a failure has to be
+/// reported explicitly, or "failed" is indistinguishable from "still running"
+/// and the strip shows a spinner forever.
 struct ThumbMsg {
     index: usize,
-    image: egui::ColorImage,
+    image: Option<egui::ColorImage>,
+}
+
+/// What the strip knows about one thumbnail.
+#[derive(Clone)]
+enum ThumbState {
+    Loading,
+    Ready(TextureHandle),
+    Failed,
 }
 
 struct ImgView {
@@ -145,7 +180,7 @@ struct ImgView {
     need_layout: bool,
 
     // Thumbnail strip.
-    thumbs: Vec<Option<TextureHandle>>,
+    thumbs: Vec<ThumbState>,
     thumb_rx: Option<Receiver<ThumbMsg>>,
     scroll_to_selected: bool,
 
@@ -193,7 +228,7 @@ impl ImgView {
 
     fn open_folder(&mut self, ctx: &egui::Context, dir: &Path, select: Option<PathBuf>) {
         self.paths = list_images(dir);
-        self.thumbs = vec![None; self.paths.len()];
+        self.thumbs = vec![ThumbState::Loading; self.paths.len()];
         self.spawn_thumb_loader();
 
         let start = select
@@ -221,13 +256,12 @@ impl ImgView {
         let paths = self.paths.clone();
         std::thread::spawn(move || {
             for (index, path) in paths.iter().enumerate() {
-                if let Ok(img) = image::open(path) {
-                    let thumb = img.thumbnail(THUMB, THUMB);
-                    let image = to_color_image(&thumb);
-                    // If the receiver is gone (folder changed), stop early.
-                    if tx.send(ThumbMsg { index, image }).is_err() {
-                        break;
-                    }
+                let image = image::open(path)
+                    .ok()
+                    .map(|img| to_color_image(&img.thumbnail(THUMB, THUMB)));
+                // If the receiver is gone (folder changed), stop early.
+                if tx.send(ThumbMsg { index, image }).is_err() {
+                    break;
                 }
             }
         });
@@ -241,6 +275,13 @@ impl ImgView {
         let path = self.paths[index].clone();
         let frames = load_frames(&path);
         if frames.is_empty() {
+            // Drop the previous image rather than leaving it on screen: it no
+            // longer matches `self.index`, and Ctrl+S would then write the old
+            // picture over *this* file.
+            self.frames.clear();
+            self.texture = None;
+            self.angle = 0;
+            self.scroll_to_selected = true;
             self.status = format!("Failed to open {}", path.display());
             return;
         }
@@ -308,6 +349,16 @@ impl ImgView {
         }
         let idx = self.cur_frame.min(self.frames.len() - 1);
         let img = Self::rotate_image(&self.frames[idx].image, self.angle);
+        // A texture larger than the GL limit is a hard panic inside egui, and
+        // that limit can be as low as 2048 — i.e. any ordinary photo. Send the
+        // GPU a downscaled copy; `frames` keeps the original, so rotate-and-save
+        // still writes full resolution.
+        let max = ctx.input(|i| i.max_texture_side).max(1) as u32;
+        let img = if img.width() > max || img.height() > max {
+            img.resize(max, max, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
         let color = to_color_image(&img);
         if let Some(tex) = self.texture.as_mut() {
             tex.set(color, TextureOptions::LINEAR);
@@ -336,20 +387,25 @@ impl ImgView {
         }
         let rotated = Self::rotate_image(&self.frames[0].image, self.angle);
         let path = self.paths[self.index].clone();
-        match rotated.save(&path) {
+        match save_image(&rotated, &path) {
             Ok(()) => {
                 // Bake rotation into our source and refresh this thumbnail.
                 let thumb = to_color_image(&rotated.thumbnail(THUMB, THUMB));
                 self.thumbs[self.index] =
-                    Some(ctx.load_texture("thumb", thumb, TextureOptions::LINEAR));
+                    ThumbState::Ready(ctx.load_texture("thumb", thumb, TextureOptions::LINEAR));
                 self.frames[0] = AnimFrame {
                     image: rotated,
                     delay: Duration::ZERO,
                 };
                 self.angle = 0;
                 self.upload_current(ctx);
+                let note = if is_jpeg(&path) {
+                    "  (JPEG re-encoded, q95)"
+                } else {
+                    ""
+                };
                 self.status = format!(
-                    "Saved rotation → {}",
+                    "Saved rotation → {}{note}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
@@ -360,7 +416,7 @@ impl ImgView {
     // ---- view transform --------------------------------------------------
     fn layout(&mut self, rect: Rect, img: Vec2) {
         // Fit-to-window, centered.
-        self.scale = (rect.width() / img.x).min(rect.height() / img.y).min(1e6);
+        self.scale = self.layout_fit_scale(rect, img);
         self.offset = (rect.size() - img * self.scale) * 0.5;
     }
 
@@ -379,11 +435,14 @@ impl eframe::App for ImgView {
                 match rx.try_recv() {
                     Ok(msg) => {
                         if msg.index < self.thumbs.len() {
-                            self.thumbs[msg.index] = Some(ctx.load_texture(
-                                "thumb",
-                                msg.image,
-                                TextureOptions::LINEAR,
-                            ));
+                            self.thumbs[msg.index] = match msg.image {
+                                Some(image) => ThumbState::Ready(ctx.load_texture(
+                                    "thumb",
+                                    image,
+                                    TextureOptions::LINEAR,
+                                )),
+                                None => ThumbState::Failed,
+                            };
                         }
                         pending = true;
                     }
@@ -572,8 +631,8 @@ impl eframe::App for ImgView {
                                             let resp = egui::Frame::none()
                                                 .stroke(stroke)
                                                 .inner_margin(2.0)
-                                                .show(ui, |ui| {
-                                                    if let Some(tex) = &self.thumbs[i] {
+                                                .show(ui, |ui| match &self.thumbs[i] {
+                                                    ThumbState::Ready(tex) => {
                                                         let size = fit_within(
                                                             tex.size_vec2(),
                                                             THUMB as f32,
@@ -582,12 +641,24 @@ impl eframe::App for ImgView {
                                                             egui::Image::new((tex.id(), size))
                                                                 .sense(Sense::click()),
                                                         )
-                                                    } else {
-                                                        ui.add_sized(
-                                                            [THUMB as f32, THUMB as f32],
-                                                            egui::Spinner::new(),
-                                                        )
                                                     }
+                                                    ThumbState::Loading => ui.add_sized(
+                                                        [THUMB as f32, THUMB as f32],
+                                                        egui::Spinner::new(),
+                                                    ),
+                                                    // Not a spinner: this file was
+                                                    // tried and cannot be decoded.
+                                                    ThumbState::Failed => ui
+                                                        .add_sized(
+                                                            [THUMB as f32, THUMB as f32],
+                                                            egui::Label::new(
+                                                                egui::RichText::new("⚠")
+                                                                    .size(28.0)
+                                                                    .color(Color32::DARK_GRAY),
+                                                            )
+                                                            .sense(Sense::click()),
+                                                        )
+                                                        .on_hover_text("Cannot decode this file"),
                                                 })
                                                 .inner;
                                             // Filename caption, middle-truncated to fit.
@@ -643,10 +714,8 @@ impl eframe::App for ImgView {
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if resp.hovered() && scroll != 0.0 {
                         let factor = (scroll / 200.0).exp2();
-                        let new_scale = (self.scale * factor).clamp(
-                            self.layout_fit_scale(rect, img) * 0.2,
-                            40.0,
-                        );
+                        let (lo, hi) = zoom_bounds(self.layout_fit_scale(rect, img));
+                        let new_scale = (self.scale * factor).clamp(lo, hi);
                         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                             let cursor = pos - rect.min.to_vec2();
                             let before = (cursor.to_vec2() - self.offset) / self.scale;
@@ -684,8 +753,15 @@ impl eframe::App for ImgView {
                         Color32::WHITE,
                     );
                 } else {
+                    // A folder *is* open and one file simply would not decode:
+                    // say so, instead of the cold-start invitation.
+                    let msg = if self.paths.is_empty() {
+                        "Open a folder or drop an image  (📂 or Ctrl+O)".to_owned()
+                    } else {
+                        format!("⚠  {}", self.status)
+                    };
                     ui.centered_and_justified(|ui| {
-                        ui.label("Open a folder or drop an image  (📂 or Ctrl+O)");
+                        ui.label(msg);
                     });
                 }
             });
@@ -704,7 +780,14 @@ impl eframe::App for ImgView {
         }
         if do_copy && !self.paths.is_empty() {
             let name = self.cur_name();
-            ctx.output_mut(|o| o.copied_text = name);
+            // Only if nothing else claimed the clipboard this frame: Ctrl+C with
+            // part of the status label selected must copy the selection, not
+            // silently replace it with the filename.
+            ctx.output_mut(|o| {
+                if o.copied_text.is_empty() {
+                    o.copied_text = name;
+                }
+            });
         }
         if go_next {
             self.next(ctx);
@@ -762,8 +845,16 @@ impl eframe::App for ImgView {
 }
 
 impl ImgView {
+    /// Scale at which `img` fits inside `rect`. Always finite and strictly
+    /// positive: callers divide by it and use it as a clamp bound, and a
+    /// degenerate (zero-sized) panel would otherwise yield 0, inf or NaN.
     fn layout_fit_scale(&self, rect: Rect, img: Vec2) -> f32 {
-        (rect.width() / img.x).min(rect.height() / img.y)
+        let fit = (rect.width() / img.x).min(rect.height() / img.y);
+        if fit.is_finite() {
+            fit.clamp(MIN_SCALE, MAX_SCALE)
+        } else {
+            1.0
+        }
     }
 }
 
@@ -784,6 +875,36 @@ fn middle_ellipsis(s: &str, max: usize) -> String {
     out.push('…');
     out.extend(&chars[chars.len() - back..]);
     out
+}
+
+/// Lower-cased extension of `path`, or an empty string.
+fn ext_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_jpeg(path: &Path) -> bool {
+    matches!(ext_of(path).as_str(), "jpg" | "jpeg")
+}
+
+/// Write `img` back over `path`, keeping the file's existing format.
+///
+/// JPEG is special-cased. A rotation cannot be applied losslessly here, so the
+/// file must be re-encoded — and `DynamicImage::save` would do that at the
+/// crate's default quality (75), visibly degrading a photo a little more on
+/// every single save. 95 keeps the damage down to something a photo survives.
+fn save_image(img: &DynamicImage, path: &Path) -> image::ImageResult<()> {
+    if !is_jpeg(path) {
+        return img.save(path);
+    }
+    let mut out = BufWriter::new(File::create(path)?);
+    // The JPEG encoder rejects alpha, so flatten to RGB first.
+    JpegEncoder::new_with_quality(&mut out, 95)
+        .encode_image(&DynamicImage::ImageRgb8(img.to_rgb8()))?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Scale a size down so its largest side is at most `max` (never up).
@@ -856,4 +977,72 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(ImgView::new(cc, arg)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this whole clamp exists for: `f32::clamp` panics when
+    /// `min > max`, which aborted the process on a scroll over a tiny image.
+    #[test]
+    fn zoom_bounds_never_cross() {
+        // 638.0 is the fit scale of a 1x1 image in a default window; 212.7 is
+        // 4x3; the rest bracket the range either side of the old threshold.
+        for fit in [1e-6, 0.01, 1.0, 31.9, 42.5, 199.0, 200.0, 212.7, 638.0, 1e6] {
+            let (lo, hi) = zoom_bounds(fit);
+            assert!(lo <= hi, "bounds crossed at fit={fit}: {lo} > {hi}");
+            // Exercising the real call proves the panic cannot come back.
+            let _ = (fit * 2.0).clamp(lo, hi);
+        }
+    }
+
+    #[test]
+    fn zoom_ceiling_lets_a_tiny_image_fill_the_window() {
+        // A 1x1 needs ~638x just to fit, so a flat 40x cap would pin it below
+        // fit-to-window and make zooming a no-op.
+        let (_, hi) = zoom_bounds(638.0);
+        assert!(hi >= 638.0);
+        // Normal images keep the plain 40x ceiling.
+        assert_eq!(zoom_bounds(1.5), (0.3, MAX_ZOOM));
+    }
+
+    #[test]
+    fn only_decodable_extensions_are_offered() {
+        // No decoder in this build: listing it only fills the strip with files
+        // that can never open.
+        assert!(!is_image(Path::new("photo.avif")));
+        // The crate knows farbfeld as `.ff` and nothing else, so `.farbfeld`
+        // could never open and `.ff` was being hidden.
+        assert!(is_image(Path::new("photo.ff")));
+        assert!(!is_image(Path::new("photo.farbfeld")));
+        assert!(is_image(Path::new("photo.JPG")));
+        assert!(is_image(Path::new("photo.png")));
+        assert!(!is_image(Path::new("notes.txt")));
+        assert!(!is_image(Path::new("noextension")));
+    }
+
+    #[test]
+    fn jpeg_detection_is_case_insensitive() {
+        assert!(is_jpeg(Path::new("a.jpg")));
+        assert!(is_jpeg(Path::new("a.JPEG")));
+        assert!(!is_jpeg(Path::new("a.png")));
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_the_extension() {
+        assert_eq!(middle_ellipsis("short.png", 16), "short.png");
+        let out = middle_ellipsis("a-very-long-file-name-indeed.jpeg", 16);
+        assert_eq!(out.chars().count(), 16);
+        assert!(out.starts_with('a') && out.ends_with("jpeg"));
+        assert_eq!(middle_ellipsis("abc", 1), "…");
+        // Multi-byte names must not be split mid-character.
+        assert_eq!(middle_ellipsis("ααααααααββββββββ.png", 8).chars().count(), 8);
+    }
+
+    #[test]
+    fn fit_within_never_upscales() {
+        assert_eq!(fit_within(Vec2::new(50.0, 20.0), 96.0), Vec2::new(50.0, 20.0));
+        assert_eq!(fit_within(Vec2::new(192.0, 96.0), 96.0), Vec2::new(96.0, 48.0));
+    }
 }
