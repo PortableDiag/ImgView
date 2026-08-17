@@ -84,29 +84,79 @@ struct AnimFrame {
     delay: Duration,
 }
 
-/// Collect an animation decoder's frames, clamping delays the way browsers do.
-fn collect_anim(frames: image::Frames) -> Vec<AnimFrame> {
-    match frames.collect_frames() {
-        Ok(list) => list
-            .into_iter()
-            .map(|f| {
-                let mut delay: Duration = f.delay().into();
-                if delay < Duration::from_millis(20) {
-                    delay = Duration::from_millis(100);
-                }
-                AnimFrame {
-                    image: DynamicImage::ImageRgba8(f.into_buffer()),
-                    delay,
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+/// What a decode produced: the frames, plus anything the user should be told
+/// about how they were produced (currently only the animation memory cap).
+struct Loaded {
+    frames: Vec<AnimFrame>,
+    note: Option<String>,
+}
+
+impl Loaded {
+    fn frames(frames: Vec<AnimFrame>) -> Self {
+        Self { frames, note: None }
     }
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+/// Default ceiling on the RAM an animation may occupy while displayed, in MiB.
+/// Override with `IMGVIEW_ANIM_BUDGET_MB` — which is also how the cap is tested
+/// without generating a gigabyte of GIF.
+const ANIM_RAM_BUDGET_MB: u64 = 1024;
+
+fn anim_budget_bytes() -> u64 {
+    std::env::var("IMGVIEW_ANIM_BUDGET_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(ANIM_RAM_BUDGET_MB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Collect an animation decoder's frames, clamping delays the way browsers do
+/// and stopping if they would exceed the memory budget.
+///
+/// Frames are pulled **one at a time on purpose**: `collect_frames()` decodes the
+/// whole animation before it returns anything, so a 4 GB GIF would already be in
+/// RAM by the time there was a total to check. Iterating means the budget is a
+/// real ceiling — we overshoot by at most the one frame that crosses it.
+fn collect_anim(frames: image::Frames) -> Loaded {
+    let budget = anim_budget_bytes();
+    let mut out: Vec<AnimFrame> = Vec::new();
+    let mut bytes: u64 = 0;
+
+    for frame in frames {
+        let Ok(frame) = frame else { break }; // keep whatever decoded cleanly
+        let mut delay: Duration = frame.delay().into();
+        if delay < Duration::from_millis(20) {
+            delay = Duration::from_millis(100);
+        }
+        let image = DynamicImage::ImageRgba8(frame.into_buffer());
+        bytes += u64::from(image.width()) * u64::from(image.height()) * 4;
+        out.push(AnimFrame { image, delay });
+
+        if bytes > budget {
+            // Show the first frame as a still rather than animate a truncated
+            // clip — a silently shortened animation is worse than none.
+            let stopped = out.len();
+            out.truncate(1);
+            out[0].delay = Duration::ZERO;
+            return Loaded {
+                frames: out,
+                note: Some(format!(
+                    "animation over the {} MiB cap (stopped at {stopped} frame{}) — first frame only",
+                    budget / (1024 * 1024),
+                    if stopped == 1 { "" } else { "s" }
+                )),
+            };
+        }
+    }
+    Loaded::frames(out)
 }
 
 /// Decode a file into frames. Static images yield a single frame; animated
 /// GIF/WebP yield every frame with per-frame delays.
-fn load_frames(path: &Path) -> Vec<AnimFrame> {
+fn load_frames(path: &Path) -> Loaded {
     let ext = ext_of(path);
 
     if ext == "gif" {
@@ -133,11 +183,11 @@ fn load_frames(path: &Path) -> Vec<AnimFrame> {
 
     // Static fallback: PNG/JPEG/BMP/TIFF/… and non-animated gif/webp.
     match image::open(path) {
-        Ok(img) => vec![AnimFrame {
+        Ok(img) => Loaded::frames(vec![AnimFrame {
             image: img,
             delay: Duration::ZERO,
-        }],
-        Err(_) => Vec::new(),
+        }]),
+        Err(_) => Loaded::frames(Vec::new()),
     }
 }
 
@@ -273,8 +323,8 @@ impl ImgView {
         }
         self.index = index;
         let path = self.paths[index].clone();
-        let frames = load_frames(&path);
-        if frames.is_empty() {
+        let loaded = load_frames(&path);
+        if loaded.is_empty() {
             // Drop the previous image rather than leaving it on screen: it no
             // longer matches `self.index`, and Ctrl+S would then write the old
             // picture over *this* file.
@@ -285,7 +335,7 @@ impl ImgView {
             self.status = format!("Failed to open {}", path.display());
             return;
         }
-        self.frames = frames;
+        self.frames = loaded.frames;
         self.cur_frame = 0;
         self.frame_elapsed = 0.0;
         self.angle = 0;
@@ -298,12 +348,18 @@ impl ImgView {
         } else {
             String::new()
         };
+        // A capped animation has to say so — otherwise it just looks broken.
+        let note = loaded
+            .note
+            .map(|n| format!("  ·  ⚠ {n}"))
+            .unwrap_or_default();
         self.status = format!(
-            "{}  [{}/{}]{}",
+            "{}  [{}/{}]{}{}",
             path.file_name().unwrap_or_default().to_string_lossy(),
             index + 1,
             self.paths.len(),
-            anim
+            anim,
+            note
         );
     }
 
@@ -949,8 +1005,12 @@ fn main() -> eframe::Result<()> {
     // Hidden diagnostic: `imgview --probe FILE` prints decoded frame info.
     if args.get(1).map(|s| s == "--probe").unwrap_or(false) {
         if let Some(p) = args.get(2) {
-            let frames = load_frames(Path::new(p));
+            let loaded = load_frames(Path::new(p));
+            let frames = loaded.frames;
             println!("frames: {}", frames.len());
+            if let Some(note) = loaded.note {
+                println!("note: {note}");
+            }
             for (i, f) in frames.iter().enumerate() {
                 let img = &f.image;
                 println!(
@@ -1038,6 +1098,21 @@ mod tests {
         assert_eq!(middle_ellipsis("abc", 1), "…");
         // Multi-byte names must not be split mid-character.
         assert_eq!(middle_ellipsis("ααααααααββββββββ.png", 8).chars().count(), 8);
+    }
+
+    #[test]
+    fn anim_budget_defaults_to_one_gib() {
+        // The operator picked 1 GB on 2026-08-16. The env override is what makes
+        // the cap testable without generating a gigabyte of GIF, so it must not
+        // change the default when unset or unparseable.
+        assert_eq!(ANIM_RAM_BUDGET_MB, 1024);
+        std::env::remove_var("IMGVIEW_ANIM_BUDGET_MB");
+        assert_eq!(anim_budget_bytes(), 1024 * 1024 * 1024);
+        std::env::set_var("IMGVIEW_ANIM_BUDGET_MB", "nonsense");
+        assert_eq!(anim_budget_bytes(), 1024 * 1024 * 1024);
+        std::env::set_var("IMGVIEW_ANIM_BUDGET_MB", "32");
+        assert_eq!(anim_budget_bytes(), 32 * 1024 * 1024);
+        std::env::remove_var("IMGVIEW_ANIM_BUDGET_MB");
     }
 
     #[test]

@@ -119,9 +119,15 @@ You can check any file against your own build without launching the GUI:
 - **Saving a rotation re-encodes a JPEG** at quality 95. JPEG cannot be rotated
   losslessly here, so a photo loses a little each time it is saved; the status
   bar says so when it happens. Other formats are re-encoded losslessly.
-- **Animated images hold every decoded frame in RAM** while displayed. Only VRAM
-  is bounded (one frame). A 48-frame 800×800 GIF costs ~117 MiB of RAM; there is
-  no cap, so a very long high-resolution animation can use a lot of memory.
+- **Animated images hold every decoded frame in RAM** while displayed — capped at
+  **1 GiB**. A 48-frame 800×800 GIF costs ~117 MiB, well inside it. Past the cap
+  the animation is refused and the first frame is shown as a still, with the
+  reason in the status bar, rather than playing a silently truncated clip. Set
+  `IMGVIEW_ANIM_BUDGET_MB` to change the ceiling:
+
+  ```bash
+  IMGVIEW_ANIM_BUDGET_MB=256 ./imgview ~/Pictures
+  ```
 - **Saving a rotation is limited to single-frame images.** Rotating an animation
   is view-only.
 - **Thumbnails are decoded at full resolution** before being scaled down, so a

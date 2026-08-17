@@ -4,6 +4,27 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
+## [0.2.1] — 2026-08-16
+
+### Added
+- **Animation memory is capped at 1 GiB.** Decoded frames are held in RAM in
+  full, and nothing bounded that: a 500-frame 1080p GIF would have decoded to
+  roughly 4 GB. Past the cap the animation is refused and the first frame is
+  shown as a still, with the reason in the status bar and in `--probe` — a
+  silently truncated animation would be worse than none. Override the ceiling
+  with `IMGVIEW_ANIM_BUDGET_MB`, which is also how the cap is tested without
+  generating a gigabyte of GIF.
+
+  Frames are now pulled from the decoder **one at a time**. `collect_frames()`
+  decodes an entire animation before it returns, so the memory would already
+  have been committed by the time there was a total to check against; iterating
+  makes the budget a real ceiling, overshooting by at most the single frame that
+  crosses it.
+
+### Known issues
+- Thumbnails still decode at full resolution before scaling.
+- Images above the GPU texture limit are still shown downscaled.
+
 ## [0.2.0] — 2026-08-16
 
 First release since `v0.1.0`. Three crashes and one silent data-loss bug are
@@ -71,7 +92,8 @@ fixed; every advertised format is now verified against a real sample.
 ### Known issues
 - **Animated images hold every decoded frame in RAM** for as long as they are
   displayed, uncapped. Measured: a 48-frame 800×800 GIF costs ~117 MiB from a
-  107 KB file. Capping this needs a memory budget to be chosen.
+  107 KB file. Capping this needs a memory budget to be chosen. *(Resolved in
+  0.2.1 — the budget chosen was 1 GiB.)*
 - **Images above the GPU texture limit are shown downscaled.** Displaying them
   at true resolution would need tiled textures.
 - **Thumbnails are decoded at full resolution** before scaling, so a folder of
