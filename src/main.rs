@@ -33,6 +33,16 @@ const IMAGE_EXTS: &[&str] = &[
 /// Hard ceiling on zoom for a normally-sized image. Small images may exceed it
 /// — see [`zoom_bounds`].
 const MAX_ZOOM: f32 = 40.0;
+
+/// Sampling for the main image. Zoomed in, nearest-neighbour shows the real
+/// pixels as sharp blocks (bilinear smeared them into an ever-softer blur);
+/// zoomed out, mipmaps keep fine detail from shimmering and aliasing.
+const VIEW_TEXTURE: TextureOptions = TextureOptions {
+    magnification: egui::TextureFilter::Nearest,
+    minification: egui::TextureFilter::Linear,
+    wrap_mode: egui::TextureWrapMode::ClampToEdge,
+    mipmap_mode: Some(egui::TextureFilter::Linear),
+};
 /// Bounds on the fit-to-window scale, so it is always finite and divisible by.
 const MIN_SCALE: f32 = 1e-6;
 const MAX_SCALE: f32 = 1e6;
@@ -417,9 +427,9 @@ impl ImgView {
         };
         let color = to_color_image(&img);
         if let Some(tex) = self.texture.as_mut() {
-            tex.set(color, TextureOptions::LINEAR);
+            tex.set(color, VIEW_TEXTURE);
         } else {
-            self.texture = Some(ctx.load_texture("current", color, TextureOptions::LINEAR));
+            self.texture = Some(ctx.load_texture("current", color, VIEW_TEXTURE));
         }
     }
 
@@ -654,6 +664,11 @@ impl eframe::App for ImgView {
                         .clicked()
                 {
                     do_copy = true;
+                }
+                if let Some(pct) = self.zoom_percent(ui.ctx()) {
+                    ui.label(format!("{pct:.0}%"))
+                        .on_hover_text("Zoom: image pixels per screen pixel  (double-click: fit ↔ 100%)");
+                    ui.separator();
                 }
                 // Selectable so the user can drag-select and copy any part of it.
                 ui.add(egui::Label::new(&self.status).selectable(true));
@@ -904,6 +919,17 @@ impl ImgView {
     /// Scale at which `img` fits inside `rect`. Always finite and strictly
     /// positive: callers divide by it and use it as a clamp bound, and a
     /// degenerate (zero-sized) panel would otherwise yield 0, inf or NaN.
+    /// Zoom relative to the *original* image in physical screen pixels, so
+    /// 100% means one image pixel per screen pixel. Corrects for the display
+    /// scale factor and for a texture downscaled to fit the GPU limit.
+    fn zoom_percent(&self, ctx: &egui::Context) -> Option<f32> {
+        let tex = self.texture.as_ref()?;
+        let orig = &self.frames.get(self.cur_frame.min(self.frames.len().saturating_sub(1)))?.image;
+        let orig_w = if self.angle % 180 == 0 { orig.width() } else { orig.height() };
+        let tex_w = tex.size()[0] as f32;
+        Some(self.scale * ctx.pixels_per_point() * tex_w / orig_w.max(1) as f32 * 100.0)
+    }
+
     fn layout_fit_scale(&self, rect: Rect, img: Vec2) -> f32 {
         let fit = (rect.width() / img.x).min(rect.height() / img.y);
         if fit.is_finite() {

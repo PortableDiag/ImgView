@@ -43,7 +43,7 @@ cargo test               # unit tests (needs CARGO_TARGET_DIR set as below)
 |---------------------|----------------------------------|
 | Right / Space       | Next image                       |
 | Left                | Previous image                   |
-| Mouse wheel         | Zoom in/out (at cursor)          |
+| Mouse wheel         | Zoom in/out (at cursor); % shown in toolbar |
 | Drag                | Pan                              |
 | Double-click        | Toggle fit ↔ 100%                |
 | R  /  ]             | Rotate right 90°                 |

@@ -4,6 +4,19 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
+## [0.2.2] — 2026-10-15
+
+### Fixed
+- **Zooming in no longer blurs the image.** The main image was drawn with
+  bilinear filtering, which smeared each pixel across its neighbours and got
+  softer the further you zoomed. Zoomed in, pixels now show as sharp blocks;
+  zoomed out, mipmaps keep fine detail from shimmering. Detail the file does not
+  have still cannot appear — a 5 px label at 450% is 5 px of information.
+
+### Added
+- **Zoom percentage in the toolbar.** 100% is one image pixel per screen pixel,
+  corrected for the display scale and for images downscaled to the GPU limit.
+
 ## [0.2.1] — 2026-08-16
 
 ### Added
