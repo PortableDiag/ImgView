@@ -4,6 +4,18 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
+## [0.2.3] — 2026-10-15
+
+### Fixed
+- **An image opened from the command line or a file manager was shown from a
+  2048-px copy.** egui reports `max_texture_side` as 2048 until the first frame
+  delivers the real GPU limit, and the startup image is uploaded before that. A
+  4000×3000 photo opened this way topped out at a 2048-wide texture — what read
+  as "100%" was really 51%, and zooming in showed a softened image. It is now
+  re-uploaded at full size once the real limit (32768 on an RTX 3080) arrives.
+  Images opened after startup were never affected. This is also why an earlier
+  note recorded the limit "on this machine" as 2048.
+
 ## [0.2.2] — 2026-10-15
 
 ### Fixed

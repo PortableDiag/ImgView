@@ -227,6 +227,7 @@ struct ImgView {
     // so a huge multi-hundred-frame GIF doesn't blow out VRAM.
     frames: Vec<AnimFrame>,      // unrotated sources (rotation stays lossless)
     texture: Option<TextureHandle>, // the single frame currently on the GPU
+    tex_limit: u32, // max_texture_side the texture was shrunk to fit; 0 = full size
     cur_frame: usize,
     frame_elapsed: f32, // seconds the current frame has been shown
     last_time: f64,     // wall-clock time (input.time) at the last update
@@ -261,6 +262,7 @@ impl ImgView {
             last_time: 0.0,
             speed: 1.0,
             angle: 0,
+            tex_limit: 0,
             scale: 1.0,
             offset: Vec2::ZERO,
             fitting: true,
@@ -420,7 +422,9 @@ impl ImgView {
         // GPU a downscaled copy; `frames` keeps the original, so rotate-and-save
         // still writes full resolution.
         let max = ctx.input(|i| i.max_texture_side).max(1) as u32;
-        let img = if img.width() > max || img.height() > max {
+        let shrink = img.width() > max || img.height() > max;
+        self.tex_limit = if shrink { max } else { 0 };
+        let img = if shrink {
             img.resize(max, max, image::imageops::FilterType::Triangle)
         } else {
             img
@@ -494,6 +498,20 @@ impl ImgView {
 
 impl eframe::App for ImgView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // egui reports max_texture_side as 2048 until the first frame brings the
+        // real GPU limit, and an image opened from the command line is uploaded
+        // before that. Re-upload it once the true limit turns out to be higher,
+        // keeping the on-screen size unchanged if the user has already zoomed.
+        if self.tex_limit != 0 && ctx.input(|i| i.max_texture_side) as u32 > self.tex_limit {
+            let old_w = self.texture.as_ref().map_or(0.0, |t| t.size()[0] as f32);
+            self.upload_current(ctx);
+            if let Some(t) = &self.texture {
+                if old_w > 0.0 && !self.fitting {
+                    self.scale *= old_w / t.size()[0] as f32;
+                }
+            }
+            self.need_layout |= self.fitting;
+        }
         // Drain a few finished thumbnails per frame into GPU textures.
         if let Some(rx) = &self.thumb_rx {
             let mut pending = false;

@@ -112,10 +112,11 @@ You can check any file against your own build without launching the GUI:
 ## Known limitations
 
 - **Images larger than the GPU's maximum texture size are downscaled for
-  display.** The limit is whatever the driver reports (commonly 2048–16384 px per
+  display.** The limit is whatever the driver reports (commonly 8192–32768 px per
   side). Only the on-screen copy is reduced — rotate-and-save still writes the
   full-resolution original — but zooming past that point shows a softened image,
-  and "actual size" (`1`) means 1:1 with the displayed copy.
+  and "actual size" (`1`) means 1:1 with the displayed copy. The toolbar zoom %
+  always measures against the file, so it shows the shortfall.
 - **Saving a rotation re-encodes a JPEG** at quality 95. JPEG cannot be rotated
   losslessly here, so a photo loses a little each time it is saved; the status
   bar says so when it happens. Other formats are re-encoded losslessly.
