@@ -384,6 +384,28 @@ impl ImgView {
             .unwrap_or_default()
     }
 
+    /// Absolute path of the current image (canonicalized when possible, so a
+    /// relative command-line argument still yields a usable full path).
+    fn cur_abs(&self) -> Option<PathBuf> {
+        let p = self.paths.get(self.index)?;
+        Some(
+            std::fs::canonicalize(p)
+                .or_else(|_| std::path::absolute(p))
+                .unwrap_or_else(|_| p.clone()),
+        )
+    }
+
+    fn cur_full_path(&self) -> String {
+        self.cur_abs()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Folder containing the current image.
+    fn cur_dir(&self) -> Option<PathBuf> {
+        self.cur_abs()?.parent().map(Path::to_path_buf)
+    }
+
     fn next(&mut self, ctx: &egui::Context) {
         if !self.paths.is_empty() {
             let i = (self.index + 1) % self.paths.len();
@@ -568,7 +590,7 @@ impl eframe::App for ImgView {
         let (mut do_fit, mut do_actual, mut do_full, mut do_esc) =
             (false, false, false, false);
         let (mut faster, mut slower, mut reset_speed) = (false, false, false);
-        let (mut do_open, mut do_copy) = (false, false);
+        let (mut do_open, mut do_copy, mut do_copy_path) = (false, false, false);
         ctx.input(|i| {
             let shift = i.modifiers.shift;
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
@@ -576,7 +598,11 @@ impl eframe::App for ImgView {
                 do_open = true;
             }
             if ctrl && i.key_pressed(Key::C) {
-                do_copy = true;
+                if shift {
+                    do_copy_path = true;
+                } else {
+                    do_copy = true;
+                }
             }
             if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::Space) {
                 go_next = true;
@@ -682,6 +708,14 @@ impl eframe::App for ImgView {
                         .clicked()
                 {
                     do_copy = true;
+                }
+                if !self.paths.is_empty()
+                    && ui
+                        .button("📋 Copy full path")
+                        .on_hover_text("Copy the full path to the clipboard  (Ctrl+Shift+C)")
+                        .clicked()
+                {
+                    do_copy_path = true;
                 }
                 if let Some(pct) = self.zoom_percent(ui.ctx()) {
                     ui.label(format!("{pct:.0}%"))
@@ -863,12 +897,21 @@ impl eframe::App for ImgView {
 
         // ---- apply actions ----
         if do_open {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            // Start the picker in the folder of the image being viewed.
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(dir) = self.cur_dir() {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(dir) = dialog.pick_folder() {
                 self.open_folder(ctx, &dir, None);
             }
         }
-        if do_copy && !self.paths.is_empty() {
-            let name = self.cur_name();
+        if (do_copy || do_copy_path) && !self.paths.is_empty() {
+            let name = if do_copy_path {
+                self.cur_full_path()
+            } else {
+                self.cur_name()
+            };
             // Only if nothing else claimed the clipboard this frame: Ctrl+C with
             // part of the status label selected must copy the selection, not
             // silently replace it with the filename.

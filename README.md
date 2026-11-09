@@ -49,8 +49,9 @@ cargo test               # unit tests (needs CARGO_TARGET_DIR set as below)
 | R  /  ]             | Rotate right 90°                 |
 | Shift+R  /  [       | Rotate left 90°                  |
 | Ctrl+S              | Save rotation back to the file   |
-| Ctrl+O              | Open a folder                    |
+| Ctrl+O              | Open a folder (starts in current image's folder) |
 | Ctrl+C              | Copy the current filename        |
+| Ctrl+Shift+C        | Copy the current file's full path |
 | F                   | Fit to window                    |
 | 1                   | Actual size (100%)               |
 | + / -               | GIF playback faster / slower     |

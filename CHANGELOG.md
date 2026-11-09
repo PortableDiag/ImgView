@@ -4,6 +4,16 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
+## [0.2.4] — 2026-11-09
+
+### Fixed
+- **Open Folder (Ctrl+O) now opens the picker in the folder of the image being
+  viewed** instead of the dialog's default location.
+
+### Added
+- **📋 Copy full path** toolbar button next to Copy name (Ctrl+Shift+C) — copies
+  the current image's absolute path.
+
 ## [0.2.3] — 2026-10-15
 
 ### Fixed
