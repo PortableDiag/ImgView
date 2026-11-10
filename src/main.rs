@@ -69,6 +69,39 @@ fn is_image(path: &Path) -> bool {
 }
 
 /// Sorted list of image files in a directory (case-insensitive by name).
+/// Folder picker that starts in `start` (the current image's folder).
+///
+/// KDE's portal (xdg-desktop-portal-kde 5.27, what rfd uses on Plasma) ignores
+/// the requested start folder and always opens at $HOME, so kdialog is tried
+/// first; it honours the start folder. Without kdialog, fall back to rfd.
+fn pick_folder(start: Option<PathBuf>) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = std::process::Command::new("kdialog");
+        cmd.args(["--title", "Open Folder", "--getexistingdirectory"]);
+        if let Some(dir) = &start {
+            cmd.arg(dir);
+        }
+        if let Ok(out) = cmd.output() {
+            // exit 0 = chosen, 1 = cancelled; anything else = try rfd.
+            match out.status.code() {
+                Some(0) => {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    let s = s.trim_end_matches('\n');
+                    return (!s.is_empty()).then(|| PathBuf::from(s));
+                }
+                Some(1) => return None,
+                _ => {}
+            }
+        }
+    }
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(dir) = start {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_folder()
+}
+
 fn list_images(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
@@ -280,6 +313,9 @@ impl ImgView {
 
     // ---- loading ---------------------------------------------------------
     fn open_path(&mut self, ctx: &egui::Context, path: &Path) {
+        // Absolute first: `imgview b.png` has parent "" — not a listable dir.
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = abs.as_path();
         if path.is_dir() {
             self.open_folder(ctx, path, None);
         } else if path.is_file() {
@@ -597,7 +633,9 @@ impl eframe::App for ImgView {
             if ctrl && i.key_pressed(Key::O) {
                 do_open = true;
             }
-            if ctrl && i.key_pressed(Key::C) {
+            // egui-winit turns Ctrl+C (and Ctrl+Shift+C) into Event::Copy and
+            // never emits Key::C, so key_pressed(Key::C) can't see it.
+            if i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
                 if shift {
                     do_copy_path = true;
                 } else {
@@ -897,12 +935,7 @@ impl eframe::App for ImgView {
 
         // ---- apply actions ----
         if do_open {
-            // Start the picker in the folder of the image being viewed.
-            let mut dialog = rfd::FileDialog::new();
-            if let Some(dir) = self.cur_dir() {
-                dialog = dialog.set_directory(dir);
-            }
-            if let Some(dir) = dialog.pick_folder() {
+            if let Some(dir) = pick_folder(self.cur_dir()) {
                 self.open_folder(ctx, &dir, None);
             }
         }

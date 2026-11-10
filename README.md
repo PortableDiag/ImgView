@@ -112,6 +112,9 @@ You can check any file against your own build without launching the GUI:
 
 ## Known limitations
 
+- **Open Folder starts in the current image's folder only when `kdialog` is
+  installed** (it is on KDE). Otherwise the system file-chooser portal is used,
+  and KDE's portal (Plasma 5.27) ignores the start folder and opens at `$HOME`.
 - **Images larger than the GPU's maximum texture size are downscaled for
   display.** The limit is whatever the driver reports (commonly 8192–32768 px per
   side). Only the on-screen copy is reduced — rotate-and-save still writes the

@@ -4,6 +4,21 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
+## [0.2.5] — 2026-11-09
+
+### Fixed
+- **`imgview photo.png` (a bare relative filename) showed "No images in" and an
+  empty viewer.** The parent of a bare filename is the empty path, which cannot be
+  listed. The argument is now made absolute before its folder is opened.
+- **Ctrl+C never copied the filename** — since it was added in v0.2.0.
+  egui-winit turns Ctrl+C into a `Copy` event and never reports the C key, so the
+  shortcut was never triggered; only the toolbar button worked. Ctrl+C and the
+  new Ctrl+Shift+C now listen for the copy event.
+- **Open Folder still opened at the home folder on KDE** — the v0.2.4 fix did
+  not work there. KDE's file-chooser portal (Plasma 5.27) ignores the requested
+  start folder. The picker now uses `kdialog` when it is installed (it honours the
+  start folder) and falls back to the portal otherwise.
+
 ## [0.2.4] — 2026-11-09
 
 ### Fixed
