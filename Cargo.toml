@@ -1,6 +1,6 @@
 [package]
 name = "imgview"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Lightweight Picasa-style image viewer"
 
@@ -8,6 +8,7 @@ description = "Lightweight Picasa-style image viewer"
 eframe = { version = "0.29", default-features = true }
 egui = "0.29"
 image = "0.25"        # broad format support: png/jpeg/gif/webp/bmp/tiff/ico/...
+arboard = "3.6"      # PRIMARY selection (egui only sets CLIPBOARD)
 rfd = "0.15"          # native folder picker
 
 [profile.release]

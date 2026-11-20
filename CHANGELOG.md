@@ -4,6 +4,14 @@ All notable changes to ImgView. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the app version in
 `Cargo.toml`.
 
+## [0.2.6] — 2026-11-20
+
+### Changed
+- **Copy name / Copy full path (and Ctrl+C / Ctrl+Shift+C) now fill both
+  clipboards** — CLIPBOARD (Ctrl+V) and PRIMARY (middle-click). egui only sets
+  CLIPBOARD; PRIMARY is set through `arboard`, already in the dependency tree.
+  Copying a selected part of the status text still copies only that selection.
+
 ## [0.2.5] — 2026-11-09
 
 ### Fixed

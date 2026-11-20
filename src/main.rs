@@ -279,6 +279,11 @@ struct ImgView {
     scroll_to_selected: bool,
 
     status: String,
+
+    // Kept alive for the whole run: on X11 the owner serves the selection, so
+    // a short-lived handle would drop PRIMARY as soon as it went out of scope.
+    // None if no clipboard is reachable — CLIPBOARD still goes through egui.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl ImgView {
@@ -304,11 +309,24 @@ impl ImgView {
             thumb_rx: None,
             scroll_to_selected: false,
             status: String::new(),
+            clipboard: arboard::Clipboard::new().ok(),
         };
         if let Some(arg) = initial {
             app.open_path(&cc.egui_ctx, Path::new(&arg));
         }
         app
+    }
+
+    /// Put `text` on the X11/Wayland PRIMARY selection (middle-click paste).
+    /// No-op on other platforms, where there is only one clipboard.
+    fn set_primary(&mut self, text: String) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(cb) = self.clipboard.as_mut() {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = text;
     }
 
     // ---- loading ---------------------------------------------------------
@@ -948,11 +966,18 @@ impl eframe::App for ImgView {
             // Only if nothing else claimed the clipboard this frame: Ctrl+C with
             // part of the status label selected must copy the selection, not
             // silently replace it with the filename.
-            ctx.output_mut(|o| {
+            let claimed = ctx.output_mut(|o| {
                 if o.copied_text.is_empty() {
-                    o.copied_text = name;
+                    o.copied_text = name.clone();
+                    true
+                } else {
+                    false
                 }
             });
+            // Also the PRIMARY selection, so middle-click pastes it too.
+            if claimed {
+                self.set_primary(name);
+            }
         }
         if go_next {
             self.next(ctx);
